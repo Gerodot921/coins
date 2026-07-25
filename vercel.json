@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "/Qwen_html_20260725_8vxtp8ags.html"
+    },
+    {
+      "source": "/((?!api/).*)",
+      "destination": "/Qwen_html_20260725_8vxtp8ags.html"
+    }
+  ]
+}
