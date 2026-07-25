@@ -1,0 +1,246 @@
+/* ============================================================
+   GIFT COIN — backend (single file, zero npm dependencies)
+   Run on YOUR server:  node server.js
+   Data persists to ./data.json (atomic writes).
+   Put it behind nginx + HTTPS; set env vars below.
+   ============================================================ */
+const http = require('http');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+/* ---------- config (env) ---------- */
+const PORT = Number(process.env.PORT || 3001);
+const BOT_TOKEN = process.env.BOT_TOKEN || '';                 // from @BotFather
+const SECRET = process.env.SERVER_SECRET || 'dev-secret-change-me';
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data.json');
+const AUTH_DEV = process.env.AUTH_DEV === '1';                 // allow no-initData (dev only!)
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';            // set to your Vercel domain in prod
+
+/* ---------- storage (in-memory Map + json file) ---------- */
+let DB = {}; // { [userId]: UserState }
+function loadDB() {
+  try { DB = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
+  catch { DB = {}; }
+  if (!DB || typeof DB !== 'object') DB = {};
+}
+function saveDB() {
+  const tmp = DATA_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(DB));
+  fs.renameSync(tmp, DATA_FILE);
+}
+loadDB();
+
+/* ---------- game constants & logic ---------- */
+const RANKS = [
+  { name: 'Bronze', from: 0 }, { name: 'Silver', from: 10000 },
+  { name: 'Gold', from: 100000 }, { name: 'Platinum', from: 1000000 },
+  { name: 'Diamond', from: 10000000 },
+];
+function rankFor(b) {
+  let i = 0; for (let k = 0; k < RANKS.length; k++) if (b >= RANKS[k].from) i = k;
+  const cur = RANKS[i], next = RANKS[i + 1];
+  return { rank: cur.name, rankCurrent: b - cur.from,
+    rankNext: next ? next.from - cur.from : cur.from,
+    level: i + 1 + Math.floor(Math.log10(Math.max(1, b - cur.from) + 1)) };
+}
+function refreshRank(u) { const r = rankFor(u.balance); Object.assign(u, r); }
+function recomputeEnergy(u, now = Date.now()) {
+  const s = Math.max(0, (now - u.lastEnergyTs) / 1000);
+  const g = Math.floor(s * u.regenPerSec);
+  if (g > 0) { u.energy = Math.min(u.maxEnergy, u.energy + g); u.lastEnergyTs = now; }
+}
+function newUser(id, username) {
+  const r = rankFor(0);
+  return { id, username, balance: 0, energy: 2500, maxEnergy: 2500, tapPower: 1,
+    regenPerSec: 1, offlinePerHour: 0, extraRewardPct: 0,
+    level: r.level, rank: r.rank, rankCurrent: r.rankCurrent, rankNext: r.rankNext,
+    boosts: {}, tasksClaimed: [], airdropDone: [], friendsCount: 0, friendsEarned: 0,
+    lastEnergyTs: Date.now(), lastLoginTs: 0, createdAt: Date.now() };
+}
+function getUser(id, username) {
+  let u = DB[id];
+  if (!u) { u = newUser(id, username); DB[id] = u; saveDB(); }
+  recomputeEnergy(u);
+  return u;
+}
+function saveUser(u) { refreshRank(u); DB[u.id] = u; saveDB(); }
+
+const BOOSTS = [
+  { id: 'multitap', baseCost: 500 }, { id: 'energy', baseCost: 1000 },
+  { id: 'regen', baseCost: 750 }, { id: 'offline', baseCost: 1500 }, { id: 'extra', baseCost: 1250 },
+];
+const boostCost = (b, lvl) => Math.floor(b.baseCost * Math.pow(1.6, lvl));
+const TASKS = [
+  { id: 'daily_login', reward: 100000, kind: 'daily', action: 'claim' },
+  { id: 'join_tg', reward: 50000, kind: 'once', action: 'link' },
+  { id: 'follow_x', reward: 50000, kind: 'once', action: 'link' },
+  { id: 'watch_video', reward: 30000, kind: 'once', action: 'video' },
+  { id: 'invite_3', reward: 100000, kind: 'once', action: 'invite' },
+];
+const AIRDROP_BASE = 10000;
+const AIRDROP_TASKS = [
+  { id: 'wallet', reward: 2000 }, { id: 'x', reward: 1000 },
+  { id: 'channel', reward: 1000 }, { id: 'inv10', reward: 5000 },
+];
+const SHOP = [
+  { id: 'silver', amount: 100000 }, { id: 'gold', amount: 550000 },
+  { id: 'platinum', amount: 1250000 }, { id: 'diamond', amount: 3000000 },
+];
+const allocOf = u => AIRDROP_BASE + AIRDROP_TASKS.filter(t => u.airdropDone.includes(t.id)).reduce((s, t) => s + t.reward, 0);
+const fmt = n => n >= 1e9 ? (n / 1e9).toFixed(1) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(0) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n);
+
+/* ---------- tokens (HMAC-signed, no cookies → works cross-origin) ---------- */
+const hmac = x => crypto.createHmac('sha256', SECRET).update(x).digest('hex');
+const b64 = o => Buffer.from(JSON.stringify(o)).toString('base64url');
+function signToken(id, username) {
+  const p = b64({ id, username, exp: Date.now() + 1000 * 60 * 60 * 24 * 30 });
+  return p + '.' + hmac(p);
+}
+function verifyToken(tok) {
+  if (!tok) return null;
+  const [p, sig] = tok.split('.'); if (!p || !sig) return null;
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(hmac(p), 'hex'))) return null;
+  } catch { return null; }
+  try {
+    const d = JSON.parse(Buffer.from(p, 'base64url').toString());
+    return d.exp > Date.now() ? { id: d.id, username: d.username } : null;
+  } catch { return null; }
+}
+
+/* ---------- Telegram initData validation ---------- */
+function validateInitData(initData) {
+  if (!initData || !BOT_TOKEN) return null;
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash'); if (!hash) return null;
+  params.delete('hash');
+  const check = [...params.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => `${k}=${v}`).join('\n');
+  const key = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+  const calc = crypto.createHmac('sha256', key).update(check).digest('hex');
+  if (calc !== hash) return null;
+  const raw = params.get('user'); if (!raw) return null;
+  try { const u = JSON.parse(raw); return { id: String(u.id), username: u.username }; }
+  catch { return null; }
+}
+
+/* ---------- http helpers ---------- */
+function send(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': CORS_ORIGIN,
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Authorization,Content-Type',
+    'Cache-Control': 'no-store',
+  });
+  res.end(body);
+}
+function readBody(req) {
+  return new Promise((resolve) => {
+    let s = ''; req.on('data', c => { if (s.length < 1e6) s += c; });
+    req.on('end', () => { try { resolve(s ? JSON.parse(s) : {}); } catch { resolve({}); } });
+  });
+}
+function authed(req) {
+  const h = req.headers['authorization'] || '';
+  return h.startsWith('Bearer ') ? verifyToken(h.slice(7)) : null;
+}
+
+/* ---------- routes ---------- */
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'OPTIONS') return send(res, 204, {});
+  const url = req.url.split('?')[0];
+  try {
+    if (url === '/auth' && req.method === 'POST') {
+      const { initData } = await readBody(req);
+      const tg = validateInitData(initData || '');
+      let id, username;
+      if (tg) { id = tg.id; username = tg.username; }
+      else if (AUTH_DEV) { id = 'dev-user'; username = 'dev'; }
+      else return send(res, 401, { error: 'invalid initData' });
+      const user = getUser(id, username); saveUser(user);
+      return send(res, 200, { token: signToken(id, username), user });
+    }
+
+    const sess = authed(req);
+    if (!sess) return send(res, 401, { error: 'unauthorized' });
+    const u = getUser(sess.id, sess.username);
+
+    if (url === '/me' && req.method === 'GET') { saveUser(u); return send(res, 200, { user: u }); }
+
+    if (url === '/tap' && req.method === 'POST') {
+      const { count } = await readBody(req);
+      const n = Math.min(200, Math.max(0, Number(count) || 0));
+      const taps = Math.min(n, u.energy);
+      const gained = taps * u.tapPower;
+      u.energy -= taps; u.balance += gained; u.lastEnergyTs = Date.now();
+      saveUser(u); return send(res, 200, { user: u, gained });
+    }
+
+    if (url === '/claim' && req.method === 'POST') {
+      const { taskId } = await readBody(req);
+      const def = TASKS.find(t => t.id === taskId);
+      if (!def) return send(res, 200, { ok: false, error: 'unknown task', user: u });
+      const now = Date.now();
+      if (def.kind === 'daily') {
+        if (new Date(u.lastLoginTs).toDateString() === new Date(now).toDateString())
+          return send(res, 200, { ok: false, error: 'already today', user: u });
+        u.lastLoginTs = now;
+      } else {
+        if (u.tasksClaimed.includes(taskId)) return send(res, 200, { ok: false, error: 'already claimed', user: u });
+        u.tasksClaimed.push(taskId);
+      }
+      const reward = Math.floor(def.reward * (1 + u.extraRewardPct));
+      u.balance += reward; if (def.action === 'invite') u.friendsCount += 3;
+      saveUser(u); return send(res, 200, { ok: true, reward, user: u });
+    }
+
+    if (url === '/boost' && req.method === 'POST') {
+      const { boostId } = await readBody(req);
+      const def = BOOSTS.find(b => b.id === boostId);
+      if (!def) return send(res, 200, { ok: false, error: 'unknown boost', user: u });
+      const lvl = u.boosts[boostId] || 0, cost = boostCost(def, lvl);
+      if (u.balance < cost) return send(res, 200, { ok: false, error: 'not enough coins', user: u });
+      u.balance -= cost; u.boosts[boostId] = lvl + 1;
+      if (boostId === 'multitap') u.tapPower += 3;
+      else if (boostId === 'energy') { u.maxEnergy += 1000; u.energy += 1000; }
+      else if (boostId === 'regen') u.regenPerSec = +(u.regenPerSec * 1.25).toFixed(2);
+      else if (boostId === 'offline') u.offlinePerHour += 100;
+      else if (boostId === 'extra') u.extraRewardPct += 0.10;
+      saveUser(u); return send(res, 200, { ok: true, user: u });
+    }
+
+    if (url === '/airdrop') {
+      if (req.method === 'GET') return send(res, 200, { user: u, allocation: allocOf(u) });
+      const { taskId } = await readBody(req);
+      if (taskId && !u.airdropDone.includes(taskId)) u.airdropDone.push(taskId);
+      saveUser(u); return send(res, 200, { user: u, allocation: allocOf(u) });
+    }
+
+    if (url === '/friends' && req.method === 'GET') {
+      const list = Array.from({ length: Math.min(u.friendsCount, 5) }, (_, i) => ({ name: '@username' + (i + 1), reward: 100000 }));
+      return send(res, 200, { user: u, list });
+    }
+
+    if (url === '/leaderboard' && req.method === 'GET') {
+      const rows = [
+        { name: '@whale_01', score: 2500000000 }, { name: '@miner_x', score: 1800000000 },
+        { name: '@tap_king', score: 1200000000 }, { name: '@you', score: u.balance, me: true },
+        { name: '@player5', score: 850000000 }, { name: '@player6', score: 650000000 },
+      ].sort((a, b) => b.score - a.score).map((r, i) => ({ rank: i + 1, name: r.name, score: fmt(r.score), me: r.me }));
+      return send(res, 200, { rows });
+    }
+
+    if (url === '/shop') {
+      if (req.method === 'GET') return send(res, 200, { user: u, packs: SHOP });
+      return send(res, 200, { ok: false, error: 'payments coming soon', user: u }); // wire Stars/TON here
+    }
+
+    return send(res, 404, { error: 'not found' });
+  } catch (e) {
+    console.error(e); return send(res, 500, { error: 'server error' });
+  }
+});
+
+server.listen(PORT, () => console.log(`GIFT COIN backend on :${PORT}  (data: ${DATA_FILE})`));
