@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "functions": {
+    "api/[...path].js": {
+      "memory": 1024,
+      "maxDuration": 10
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/$1"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/gift-coin-front.html"
+    }
+  ]
+}
