@@ -295,6 +295,16 @@ const state = {
   upgradeSlot: null, wheelAngle: 0, wheelSpinning: false,
 };
 
+function go(screen) {
+  if (ROOTS.includes(screen)) state.tab = screen;
+  state.screen = screen;
+  if (screen==='profile' || screen==='friends') {
+    api('/friends').then(r=>{ state.friends=r.list; render(); }).catch(()=>{});
+  }
+  render();
+}
+function back() { go(state.tab||'earn'); }
+
 function loadLocal() {
   try { return JSON.parse(localStorage.getItem('gc_local') || '{}'); }
   catch { return {}; }
@@ -362,16 +372,6 @@ function toast(msg) {
   const el = $('#toast'); el.textContent = msg; el.classList.add('show');
   clearTimeout(toastT); toastT = setTimeout(()=>el.classList.remove('show'), 2000);
 }
-
-function go(screen) {
-  if (ROOTS.includes(screen)) state.tab = screen;
-  state.screen = screen;
-  if (screen==='profile' || screen==='friends') {
-    api('/friends').then(r=>{ state.friends=r.list; render(); }).catch(()=>{});
-  }
-  render();
-}
-function back() { go(state.tab||'earn'); }
 
 function header(title, nested) {
   const left = nested
@@ -623,7 +623,7 @@ function screenProfile() {
     ['i-store','Магазин коинов','shop'],['i-crown','Подписка PRO','subscription'],
     ['i-zap','Бустеры','boost'],['i-share','Рефералы','friends'],
     ['i-sword','Кланы','clans'],['i-chart','Статистика','stats'],
-    ['i-vault','Стейкинг','staking'],['i-cog','Настройки',null],
+    ['i-vault','Стейкинг','staking'],['i-cog','Настройки','settings'],
   ];
   return header('ПРОФИЛЬ', false) + `<div class="sc">
     <div class="card glass row">
@@ -641,7 +641,7 @@ function screenProfile() {
       <div class="card glass"><small>Друзья</small><b>${u.friendsCount}</b></div>
       <div class="card glass"><small>Кейсов</small><b>${state.local.achievements.cases}</b></div>
     </div>
-    <div class="menu">${menu.map(([ic,t,to])=>`<div class="card glass row" ${to?`data-act="go" data-to="${to}"`:`data-act="soon"`}>
+    <div class="menu">${menu.map(([ic,t,to])=>`<div class="card glass row" data-act="go" data-to="${to}">
       <div class="bx">${I(ic)}</div><div class="t"><b>${t}</b></div><span class="mut">${I('i-back')}</span></div>`).join('')}
     </div>
   </div>`;
@@ -720,6 +720,38 @@ function screenFriends() {
       <div class="bx">${I('i-users')}</div><div class="t"><b>${f.name}</b></div>
       <small class="mut">+${fmt(f.reward)}</small></div>`).join('')
       : `<div class="empty">Пока нет рефералов.<br>Приглашай друзей и получай % от их заработка.</div>`}
+  </div>`;
+}
+
+function screenSettings() {
+  const u = state.user;
+  return header('НАСТРОЙКИ', true) + `<div class="sc">
+    <div class="card glass row" style="margin-bottom:12px">
+      <div class="bx" style="width:48px;height:48px;border-radius:50%;font-size:22px;overflow:hidden">${avatarHtml('lg')}</div>
+      <div class="t"><b>@${u.username||'player'}</b><small>ID: ${u.id||'—'}</small></div>
+    </div>
+    <div class="menu">
+      <div class="card glass row" data-act="toggle-theme">
+        <div class="bx">${I('i-moon')}</div><div class="t"><b>Тема</b><small>Тёмная / Светлая</small></div>
+        <span class="pill">Тёмная</span>
+      </div>
+      <div class="card glass row" data-act="toggle-lang">
+        <div class="bx">${I('i-life')}</div><div class="t"><b>Язык</b><small>Русский / English</small></div>
+        <span class="pill">RU</span>
+      </div>
+      <div class="card glass row" data-act="notifications">
+        <div class="bx">${I('i-batt')}</div><div class="t"><b>Уведомления</b><small>Включить / Выключить</small></div>
+        <span class="pill on">Вкл</span>
+      </div>
+      <div class="card glass row" data-act="support">
+        <div class="bx">${I('i-share')}</div><div class="t"><b>Поддержка</b><small>Связаться с нами</small></div>
+        <span class="mut">${I('i-back')}</span>
+      </div>
+      <div class="card glass row" data-act="about">
+        <div class="bx">${I('i-shield')}</div><div class="t"><b>О проекте</b><small>Версия 1.0.0</small></div>
+        <span class="mut">${I('i-back')}</span>
+      </div>
+    </div>
   </div>`;
 }
 
@@ -802,7 +834,7 @@ function render() {
     shop:screenShop, subscription:screenSubscription, boost:screenBoost, friends:screenFriends,
     clans:screenClans, vault:screenVault, upgrader:screenUpgrader, wheel:screenWheel,
     quiz:screenQuiz, leaderboard:screenLeaderboard, achievements:screenAchievements,
-    stats:screenStats, staking:screenStaking, daily:screenDaily,
+    stats:screenStats, staking:screenStaking, daily:screenDaily, settings:screenSettings,
   };
   $('#app').innerHTML = (map[state.screen]||screenEarn)() + nav();
   if (state.screen==='earn') bindCoin();
@@ -874,7 +906,10 @@ function bindCoin() {
       saveLocal(); toast('Бонус +'+fmt(bonus)+'!');
     }
     pending++;
-    if (!flushTimer) flushTimer = setInterval(flushTaps, 700);
+    // Отправляем запрос на бек только когда накопилось 5 тапов
+    if (pending >= 5) {
+      flushTaps();
+    }
   };
 }
 function spawnFloat(wrap, ev, txt) {
@@ -1024,6 +1059,10 @@ document.addEventListener('click', async ev => {
     toast('Demo режим — backend недоступен');
   }
   render();
+  
+  // Обработчики для отправки оставшихся тапов при закрытии/сворачивании приложения
+  window.addEventListener('beforeunload', () => { if (pending > 0) flushTaps(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden && pending > 0) flushTaps(); });
 })();
 </script>
 </body>
